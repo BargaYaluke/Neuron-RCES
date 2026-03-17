@@ -241,29 +241,29 @@ def evaluate_cifar_corruption(args, model, data_dir="./data/CIFAR-100-C"):
 
 def evaluate(args, model, dataloader, criterion):
     model.eval()
-    loss = 0
+    total_loss = 0.0
     correct = 0
     total = 0
     with torch.no_grad():
         for batch_idx, (inputs, targets) in enumerate(dataloader):
             inputs, targets = inputs.to(args.device), targets.to(args.device)
             outputs = model(inputs)
-            loss = criterion(outputs, targets)
-
-            loss += loss.item()
+            batch_loss = criterion(outputs, targets)
+            total_loss += batch_loss.item() * targets.size(0)
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
 
     acc = 100. * correct / total
-    return loss, acc
+    avg_loss = total_loss / total if total else 0.0
+    return avg_loss, acc
 
 
 class Normalize(nn.Module):
     def __init__(self, mean, std) :
         super(Normalize, self).__init__()
-        self.register_buffer('mean', torch.Tensor(mean).to("cuda"))
-        self.register_buffer('std', torch.Tensor(std).to("cuda"))
+        self.register_buffer('mean', torch.tensor(mean, dtype=torch.float32))
+        self.register_buffer('std', torch.tensor(std, dtype=torch.float32))
         
     def forward(self, input):
         # Broadcasting
@@ -327,9 +327,11 @@ def init_params(net):
             if m.bias:
                 init.constant(m.bias, 0)
 
-
-_, term_width = os.popen('stty size', 'r').read().split()
-term_width = int(term_width)
+try:
+    _, term_width = os.popen('stty size', 'r').read().split()
+    term_width = int(term_width)
+except ValueError:
+    term_width = 80
 
 TOTAL_BAR_LENGTH = 65.
 last_time = time.time()
