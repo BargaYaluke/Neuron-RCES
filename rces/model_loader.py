@@ -129,7 +129,7 @@ def _read_model_info(rb_dataset, threat_model, model_name, model_dir):
 def load_robust_model(arch, dataset, model_name=None, threat_model="Linf",
                       model_dir="./rb_models", num_classes=None,
                       allow_timm_fallback=False, xcit_state_dict=None,
-                      logger=None):
+                      torch_hub_dir=None, logger=None):
     """
     Load a robust backbone and return (model, meta).
 
@@ -147,6 +147,16 @@ def load_robust_model(arch, dataset, model_name=None, threat_model="Linf",
       model_name, footnote, additional_data
     """
     log = (logger.info if logger is not None else print)
+
+    # Redirect the torch.hub weight cache to a PERSISTENT dir so the XCiT weights
+    # (fetched via torch.hub into ~/.cache by default) survive container/pod
+    # restarts. torch.hub stores files under <torch_hub_dir>/checkpoints/.
+    if torch_hub_dir:
+        hub = os.path.abspath(torch_hub_dir)
+        os.makedirs(os.path.join(hub, "checkpoints"), exist_ok=True)
+        torch.hub.set_dir(hub)
+        log(f"[loader] torch.hub dir -> {hub} "
+            f"(weights cached in {os.path.join(hub, 'checkpoints')})")
 
     # Tiny-ImageNet rides on the ImageNet-1k robust backbone.
     rb_dataset = "imagenet" if dataset == "tinyimagenet" else dataset
@@ -178,10 +188,19 @@ def load_robust_model(arch, dataset, model_name=None, threat_model="Linf",
                            threat_model=threat_model, model_dir=model_dir)
         meta["source"] = "robustbench"
         meta["self_normalizing"] = True
-    except ImportError:
-        log("[loader][ERROR] RobustBench not installed. Install with:")
-        log("    pip install git+https://github.com/RobustBench/robustbench.git")
-        log("    (pulls timm>=1.0.9 + autoattack)")
+    except Exception as e:
+        if isinstance(e, ImportError) and "robustbench" in (str(e) + repr(e)).lower():
+            log("[loader][ERROR] RobustBench not installed. Install with:")
+            log("    pip install git+https://github.com/RobustBench/robustbench.git")
+            log("    (pulls timm>=1.0.9 + autoattack)")
+        else:
+            log(f"[loader][ERROR] RobustBench import/load failed: "
+                f"{type(e).__name__}: {e}")
+            log("[loader][HINT] If this is \"'type' object is not subscriptable\" on "
+                "Python 3.8, the installed robustbench uses PEP 585 'list[...]' "
+                "annotations that require Python >=3.9. Fix: (a) run in a Python>=3.9 "
+                "env, or (b) add 'from __future__ import annotations' to the "
+                "robustbench source (one-shot: python rces/patch_robustbench_py38.py).")
         if not (allow_timm_fallback and arch.startswith("xcit")):
             raise
         try:

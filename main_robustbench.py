@@ -78,6 +78,10 @@ def parse_args():
                    help="RobustBench model_name (defaults chosen per arch/dataset)")
     p.add_argument("--threat_model", default="Linf", choices=["Linf", "L2"])
     p.add_argument("--model_dir", default="./rb_models")
+    p.add_argument("--torch_hub_dir", default="./XCiT-S12-checkpoint",
+                   help="persistent dir for the torch.hub weight cache (the XCiT "
+                        "download), so it survives pod restarts. Weights land in "
+                        "<dir>/checkpoints/. Pass '' to use the default ~/.cache.")
     p.add_argument("--num_classes", default=None, type=int,
                    help="override target #classes (default inferred from dataset)")
     p.add_argument("--img_size", default=224, type=int,
@@ -155,7 +159,8 @@ def main():
         arch=args.arch, dataset=args.dataset, model_name=args.model_name,
         threat_model=args.threat_model, model_dir=args.model_dir,
         num_classes=target_classes, allow_timm_fallback=args.allow_timm_fallback,
-        xcit_state_dict=args.xcit_state_dict, logger=logger)
+        xcit_state_dict=args.xcit_state_dict,
+        torch_hub_dir=(args.torch_hub_dir or None), logger=logger)
     model = model.to(args.device)
     logger.info(f"[meta] {meta}")
 

@@ -18,6 +18,21 @@ If `robustbench` cannot be installed, the XCiT path can fall back to a **clean
 (non-robust)** timm XCiT via `--allow_timm_fallback` (only useful for plumbing tests;
 not a robust starting point).
 
+### Python 3.8 compatibility (the `rift` conda env)
+
+The current RobustBench uses PEP 585 builtin generics in annotations
+(`norm_layer: list[Callable[..., nn.Module]]`). On **Python 3.8** importing it raises
+`TypeError: 'type' object is not subscriptable` (PEP 585 needs Python ≥3.9). Two fixes:
+
+- **Recommended (clean):** run in a Python ≥3.9 env.
+- **Fast (keep the 3.8 `rift` env):** add `from __future__ import annotations` to the
+  robustbench source — one shot:
+  ```bash
+  python rces/patch_robustbench_py38.py    # idempotent; verifies the import afterwards
+  ```
+  If a *non-annotation* 3.9-only line remains, the script prints the new error — send it
+  back and we patch that line (or move to Python ≥3.9).
+
 ## The one rule that matters most
 
 RobustBench models **normalize inputs internally**. This pipeline therefore keeps
@@ -72,6 +87,7 @@ Add `--autoattack --autoattack_n 1000` for a RobustBench AutoAttack number on to
 | `--head_warmup_epochs` | linear-probe the fresh 200-class head before sparse adaptation |
 | `--num_grad_batches`, `--adv_steps` | adversarial batches / PGD steps for the MRC estimate |
 | `--pgd_steps`, `--pgd_restarts`, `--eval_batches` | evaluation PGD settings |
+| `--torch_hub_dir` | persistent dir for the XCiT weight cache (default `./XCiT-S12-checkpoint`; weights land in `<dir>/checkpoints/`); survives pod restarts |
 | `--diagnostic_only` | print inventory + caveats, then exit |
 | `--allow_timm_fallback`, `--xcit_state_dict` | non-robustbench XCiT loading |
 
