@@ -115,7 +115,7 @@ def neuron_mrc_and_prune(args, model,
     origin_correct = 0
 
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         for inputs, targets in adv_loader:
             inputs = inputs.to(args.device)
             targets = targets.to(args.device)
@@ -460,21 +460,51 @@ def parse_args():
     parser.add_argument("--mask_mode", type=str, default="grad", choices=["grad", "param"],
                     help="grad: gate gradients; param: hard-freeze frozen entries after optimizer step")
 
-
-
+# ---------- 性能 / 吞吐相关参数 ----------
+    parser.add_argument('--num_workers', type=int, default=(2 if os.name == "nt" else 4),
+                    help='DataLoader worker processes (Windows defaults lower: spawn is costly)')
+    parser.add_argument('--amp', action='store_true', default=False,
+                    help='enable torch.cuda.amp mixed precision in the train loop (fp16 compute). '
+                         'Off by default to keep fp32 reproducibility; the gradient mask stays exact.')
+    parser.add_argument('--tf32', action='store_true', default=False,
+                    help='allow TF32 tensor-core matmul/conv on Ampere+. Off by default because it '
+                         'perturbs the fp32 path (MRC grads / robust-acc reporting).')
+    parser.add_argument('--compile', action='store_true', default=False,
+                    help='wrap the model in torch.compile (one-time warmup cost; needs DataParallel off).')
 
     return parser.parse_args()
+
+def _strip_module_prefix(name):
+    """Canonicalize a parameter name by removing leading wrapper prefixes
+    ('module.' from DataParallel, '_orig_mod.' from torch.compile) in any order,
+    so mask keys match whether or not the model is wrapped."""
+    changed = True
+    while changed:
+        changed = False
+        for pre in ("module.", "_orig_mod."):
+            if name.startswith(pre):
+                name = name[len(pre):]
+                changed = True
+    return name
+
 
 @torch.no_grad()
 def apply_param_freeze(model, neuron_masks, init_sd, device):
     # neuron_masks: mask=0 可训练, mask=1 冻结（与你保存的定义一致）
     for name, p in model.named_parameters():
-        if name not in neuron_masks:
+        key = _strip_module_prefix(name)
+        if key not in neuron_masks:
             continue
-        mask = neuron_masks[name].to(device, non_blocking=True)
+        mask = neuron_masks[key].to(device, non_blocking=True)
         train_mask = 1.0 - mask  # 1=可训练, 0=冻结
 
-        w0 = init_sd[name].to(device, non_blocking=True)
+        # init_sd is keyed like the live model in the common cases, but under
+        # torch.compile named_parameters() carries '_orig_mod.' while state_dict()
+        # may not — fall back to the canonicalized key so this never KeyErrors.
+        w0 = init_sd.get(name)
+        if w0 is None:
+            w0 = init_sd[key]
+        w0 = w0.to(device, non_blocking=True)
         # 冻结位置覆盖回 w0，可训练位置保持当前值
         p.data.mul_(train_mask).add_(w0 * (1.0 - train_mask))
 
@@ -488,6 +518,8 @@ def training_one_epoch(
     logger,
     neuron_masks=None,   # {param_name: mask_tensor}，0=可训练，1=冻结
     mixup_fn=None,       # 以后你想加 SupCon / mixup 可以用
+    gate_list=None,      # 预先算好的 [(param, train_mask)]，避免每个 batch 重建
+    scaler=None,         # torch.cuda.amp.GradScaler；None / disabled 时走 fp32
 ):
     """
     单轮训练：
@@ -498,9 +530,28 @@ def training_one_epoch(
     model.train()
     device = args.device
 
-    total_loss = 0.0
-    total_correct = 0
+    use_amp = scaler is not None and scaler.is_enabled()
+
+    # GPU-resident accumulators: summing on the GPU avoids a forced CUDA sync
+    # (.item()) every iteration — that per-batch host<->device round trip is the
+    # main reason the GPU sits idle ("memory not full, throughput low"). We only
+    # copy to host at log points / end of epoch. float64 keeps the original
+    # logging precision exactly; these values never feed back into training.
+    running_loss = torch.zeros((), device=device, dtype=torch.float64)
+    running_correct = torch.zeros((), device=device, dtype=torch.long)
     total_samples = 0
+
+    # Legacy fallback: if main() did not pass a precomputed gate_list but did
+    # pass a mask dict, build the (param, 1-mask) pairs ONCE here. Keys are
+    # normalized (strip 'module.') so a DataParallel prefix can never make the
+    # masking silently no-op.
+    if gate_list is None and neuron_masks is not None:
+        gate_list = []
+        for name, p in model.named_parameters():
+            key = _strip_module_prefix(name)
+            if key in neuron_masks:
+                m = (1.0 - neuron_masks[key].to(device)).to(dtype=p.dtype)
+                gate_list.append((p, m))
 
     start = time.time()
     num_batches = len(trainloader)
@@ -510,61 +561,54 @@ def training_one_epoch(
         # ------------------------ data to device ------------------------
         data_time = time.time() - start
 
-        inputs = inputs.to(device)
-        targets = targets.to(device)
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
 
         # ------------------------ forward & loss ------------------------
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
 
         batch_size = targets.size(0)
-        total_loss += loss.item() * batch_size
+        running_loss += loss.detach().double() * batch_size
 
         # ------------------------ backward ------------------------
-        loss.backward()
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         # ---- 关键：神经元级 mask（0=可训练，1=冻结） ----
-        if neuron_masks is not None:
+        # A 0/1 mask commutes with GradScaler's positive scalar, so multiplying
+        # the (possibly scaled) grads here before scaler.step is exact.
+        if gate_list:
             with torch.no_grad():
-                for name, param in model.named_parameters():
-                    if param.grad is None:
-                        continue
-                    if name not in neuron_masks:
-                        continue
+                for p, train_mask in gate_list:
+                    if p.grad is not None:
+                        p.grad.mul_(train_mask)
 
-                    mask = neuron_masks[name]
-                    # 确保 mask 在同一设备
-                    if mask.device != param.grad.device:
-                        mask = mask.to(param.grad.device)
-                        neuron_masks[name] = mask  # 顺手缓存一下
-
-                    # 约定：mask=0 → 该位置“允许更新”；mask=1 → 冻结
-                    # 因此梯度应该在 mask==1 的位置清零：
-                    #  train_mask = 1 - mask : (1 表示可更新)
-                    train_mask = 1.0 - mask
-                    param.grad.mul_(train_mask)
-
-        optimizer.step()
+        if use_amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
 
         if neuron_masks is not None and getattr(args, "mask_mode", "grad") == "param":
             apply_param_freeze(model, neuron_masks, args.init_sd, device)
-        
-
-
 
         # ------------------------ 统计精度 ------------------------
         # 注意：如果后面你用 mixup / label-smoothing，这种 hard label 精度就不再准确了
         _, predicted = outputs.max(1)
         total_samples += batch_size
-        total_correct += predicted.eq(targets).sum().item()
+        running_correct += predicted.eq(targets).sum()
 
         # ------------------------ 日志 & 计时 ------------------------
         batch_time = time.time() - start
 
         if (batch_idx % log_interval == 0) or (batch_idx == num_batches - 1):
-            avg_loss = total_loss / max(total_samples, 1)
-            avg_acc = 100.0 * total_correct / max(total_samples, 1)
+            avg_loss = (running_loss / max(total_samples, 1)).item()
+            avg_acc = (100.0 * running_correct.double() / max(total_samples, 1)).item()
             logger.info(
                 "Epoch [{}/{}]  Batch [{}/{}]  "
                 "Loss: {:.4f} (avg {:.4f})  "
@@ -580,8 +624,8 @@ def training_one_epoch(
 
         start = time.time()
 
-    epoch_loss = total_loss / max(total_samples, 1)
-    epoch_acc = 100.0 * total_correct / max(total_samples, 1)
+    epoch_loss = (running_loss / max(total_samples, 1)).item()
+    epoch_acc = (100.0 * running_correct.double() / max(total_samples, 1)).item()
 
     logger.info(
         "==> Epoch {} done. Train loss: {:.4f}, train acc: {:.2f}%".format(
@@ -604,20 +648,21 @@ def validate_clean(args, model, loader, criterion, logger, prefix=""):
     model.eval()
 
     device = args.device
-    total_loss = 0.0
-    total_correct = 0
+    # GPU-resident accumulators (sync once per log point / end) — see training loop.
+    running_loss = torch.zeros((), device=device, dtype=torch.float64)
+    running_correct = torch.zeros((), device=device, dtype=torch.long)
     total_samples = 0
 
     start = time.time()
     num_batches = len(loader)
     log_interval = getattr(args, "log_interval", 50)  # 没设的话默认 50
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch_idx, (inputs, targets) in enumerate(loader):
             data_time = time.time() - start
 
-            inputs = inputs.to(device)
-            targets = targets.to(device)
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
             # 可选：channels_last 优化（和 GPS 对齐的接口）
             if getattr(args, "channels_last", False):
@@ -627,17 +672,17 @@ def validate_clean(args, model, loader, criterion, logger, prefix=""):
             loss = criterion(outputs, targets)
 
             batch_size = targets.size(0)
-            total_loss += loss.item() * batch_size
+            running_loss += loss.detach().double() * batch_size
 
             _, predicted = outputs.max(1)
             total_samples += batch_size
-            total_correct += predicted.eq(targets).sum().item()
+            running_correct += predicted.eq(targets).sum()
 
             batch_time = time.time() - start
 
             if (batch_idx % log_interval == 0) or (batch_idx == num_batches - 1):
-                avg_loss = total_loss / max(total_samples, 1)
-                avg_acc = 100.0 * total_correct / max(total_samples, 1)
+                avg_loss = (running_loss / max(total_samples, 1)).item()
+                avg_acc = (100.0 * running_correct.double() / max(total_samples, 1)).item()
                 batch_acc = 100.0 * predicted.eq(targets).float().mean().item()
 
                 logger.info(
@@ -655,8 +700,8 @@ def validate_clean(args, model, loader, criterion, logger, prefix=""):
 
             start = time.time()
 
-    test_loss = total_loss / max(total_samples, 1)
-    test_acc = 100.0 * total_correct / max(total_samples, 1)
+    test_loss = (running_loss / max(total_samples, 1)).item()
+    test_acc = (100.0 * running_correct.double() / max(total_samples, 1)).item()
 
     logger.info(
         "==> {}Clean test done. loss: {:.4f}, acc: {:.2f}%".format(
@@ -709,6 +754,17 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
+
+    # -------------------- 性能后端设置 --------------------
+    if torch.cuda.is_available():
+        # 输入尺寸固定（CIFAR 32x32 / TinyImageNet）时，cuDNN 自动调优会挑到更快的卷积
+        # 算法；只在第一次见到某个形状时多花一点时间，之后纯加速。
+        torch.backends.cudnn.benchmark = True
+        if args.tf32:
+            # TF32 张量核：会扰动 FP32 路径（影响 MRC 选择梯度与鲁棒精度报数），默认关闭。
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
     proj_name = "rift"
     best_acc = 0  # best test accuracy
@@ -766,7 +822,8 @@ def main():
     transform_dict = {"train": transform_train, "test": transform_test}
 
     trainloader, _, testloader = create_dataloader(
-        args.dataset, args.batch_size, use_val=False, transform_dict=transform_dict
+        args.dataset, args.batch_size, use_val=False, transform_dict=transform_dict,
+        num_workers=args.num_workers, pin_memory=True
     )
 
     logger.info('==> Building dataloaders...')
@@ -784,6 +841,16 @@ def main():
         if torch.isinf(p).any():
             print("[PARAM INF]", name)
     logger.info(args.model)
+
+    # 可选：torch.compile（首个 batch 有一次性编译预热开销，之后加速）。
+    # 与 DataParallel 不兼容，因此仅在未包装（单卡）时启用；掩码键已通过
+    # _strip_module_prefix 兼容 compile 引入的 '_orig_mod.' 前缀。
+    if getattr(args, "compile", False) and hasattr(torch, "compile") and torch.cuda.is_available():
+        if isinstance(model, torch.nn.DataParallel):
+            logger.info("==> [compile] skipped: torch.compile + DataParallel not supported; staying eager.")
+        else:
+            model = torch.compile(model)
+            logger.info("==> [compile] model wrapped with torch.compile.")
 
     logger.info('==> Building optimizer and learning rate scheduler...')
     optimizer = create_optimizer(
@@ -873,9 +940,12 @@ def main():
     raw_masks = mask_ckpt["masks"]   # 就是你在 cal_neuron_mrc 时保存的 new_masks
 
     # === 修正参数名前缀 ===
+    # 去掉保存时可能带的 DataParallel "module." / torch.compile "_orig_mod." 前缀，
+    # 以及旧的 norm-layer "<idx>." 前缀，统一成与（去包装后的）模型一致的规范键。
+    # 否则 `name not in neuron_masks` 恒为真 → 掩码静默失效，所有权重都会被训练。
     neuron_masks = {}
     for name, mask in raw_masks.items():
-        new_name = re.sub(r"^\d+\.", "", name)
+        new_name = _strip_module_prefix(re.sub(r"^\d+\.", "", _strip_module_prefix(name)))
         neuron_masks[new_name] = mask.to(args.device)
 
     logger.info(f"Loaded {len(neuron_masks)} neuron masks after key alignment.")
@@ -883,6 +953,27 @@ def main():
     print("Example of neuron_mask keys after cleaning:")
     for k in list(neuron_masks.keys())[:10]:
         print(" ", k)
+
+    # 预先计算 (param, train_mask=1-mask)，避免每个 batch 重新遍历 named_parameters()、
+    # 重复做设备检查与重建 1-mask；并统计匹配上的参数张量数，若一个都没匹配上立即报错。
+    gate_list = []
+    matched = 0
+    for name, p in model.named_parameters():
+        key = _strip_module_prefix(name)
+        if key in neuron_masks:
+            matched += 1
+            tm = (1.0 - neuron_masks[key].to(args.device)).to(dtype=p.dtype)
+            gate_list.append((p, tm))
+    assert matched > 0, (
+        "No neuron-mask keys matched model parameters (prefix mismatch); gradient "
+        "masking would be a silent no-op. Re-generate neuron_masks.pth or check keys."
+    )
+    logger.info(f"Gradient mask active on {matched} parameter tensor(s).")
+
+    # AMP scaler：--amp 时启用，否则 disabled（走 fp32，数值与原来一致）。
+    scaler = torch.cuda.amp.GradScaler(
+        enabled=(getattr(args, "amp", False) and str(args.device).startswith("cuda"))
+    )
     # -------------------- 标准微调训练循环 --------------------
     last_robust_acc = None
     record_path = os.path.join(model_save_dir, "experiment_record.json") 
@@ -900,6 +991,8 @@ def main():
             epoch=epoch,
             logger=logger,
             neuron_masks=neuron_masks,
+            gate_list=gate_list,
+            scaler=scaler,
         )
         logger.info("==> Train loss: {:.2f}, train acc: {:.2f}%".format(train_loss, train_acc))
 

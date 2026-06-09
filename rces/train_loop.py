@@ -26,36 +26,71 @@ def apply_grad_mask(model, neuron_masks):
 
 
 def adapt_one_epoch(model, loader, optimizer, criterion, neuron_masks, device,
-                    epoch, logger, log_interval=50):
+                    epoch, logger, log_interval=50, scaler=None):
     """One epoch of clean-data sparse adaptation with gradient gating."""
     model.train()
-    total_loss, total, correct = 0.0, 0, 0
+    use_amp = scaler is not None and scaler.is_enabled()
+
+    # GPU-resident accumulators: summing on the GPU avoids the per-batch .item()
+    # CUDA sync that otherwise stalls the input pipeline. Synced once per log point.
+    total_loss = torch.zeros((), device=device, dtype=torch.float64)
+    correct = torch.zeros((), device=device, dtype=torch.long)
+    total = 0
+
+    # Precompute (param, keep = 1 - mask) ONCE so the hot loop has no
+    # named_parameters() walk, dict lookup, 1-mask rebuild or shape assert.
+    mask_pairs = []
+    if neuron_masks is not None:
+        for name, p in model.named_parameters():
+            m = neuron_masks.get(name)
+            if m is None:
+                continue
+            assert tuple(m.shape) == tuple(p.shape), (
+                f"{name}: mask {tuple(m.shape)} != param {tuple(p.shape)}")
+            mask_pairs.append((p, (1.0 - m.to(device)).to(dtype=p.dtype)))
+
     n = len(loader)
     start = time.time()
 
     for i, (x, y) in enumerate(loader):
-        x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()
-        out = model(x)
-        loss = criterion(out, y)
-        loss.backward()
-        if neuron_masks is not None:
-            apply_grad_mask(model, neuron_masks)
-        optimizer.step()
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            out = model(x)
+            loss = criterion(out, y)
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        # A 0/1 mask commutes with GradScaler's positive scalar, so masking the
+        # (possibly scaled) grads here is exact (mask==0 trainable, mask==1 frozen).
+        if mask_pairs:
+            with torch.no_grad():
+                for p, keep in mask_pairs:
+                    if p.grad is not None:
+                        p.grad.mul_(keep)
+        if use_amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
 
         bs = y.size(0)
-        total_loss += loss.item() * bs
+        total_loss += loss.detach().double() * bs
         total += bs
-        correct += (out.argmax(1) == y).sum().item()
+        correct += (out.argmax(1) == y).sum()
 
         if (i % log_interval == 0) or (i == n - 1):
+            loss_val = (total_loss / max(total, 1)).item()
+            acc_val = (100.0 * correct.double() / max(total, 1)).item()
             logger.info(
                 f"Adapt Epoch[{epoch}] [{i}/{n}] "
-                f"loss {total_loss / max(total, 1):.4f} "
-                f"acc {100.0 * correct / max(total, 1):.2f}% "
+                f"loss {loss_val:.4f} "
+                f"acc {acc_val:.2f}% "
                 f"({time.time() - start:.1f}s)")
 
-    return total_loss / max(total, 1), 100.0 * correct / max(total, 1)
+    return (total_loss / max(total, 1)).item(), (100.0 * correct.double() / max(total, 1)).item()
 
 
 def linear_probe_epochs(model, loader, criterion, device, epochs, lr,
@@ -81,20 +116,25 @@ def linear_probe_epochs(model, loader, criterion, device, epochs, lr,
     opt = torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
     model.train()
     for e in range(epochs):
-        total_loss, total, correct = 0.0, 0, 0
+        # GPU-resident accumulators: this loop previously synced TWICE every batch
+        # with no log gating — the worst offender. Sync once per epoch now.
+        total_loss = torch.zeros((), device=device, dtype=torch.float64)
+        correct = torch.zeros((), device=device, dtype=torch.long)
+        total = 0
         for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            opt.zero_grad()
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            opt.zero_grad(set_to_none=True)
             out = model(x)
             loss = criterion(out, y)
             loss.backward()
             opt.step()
             bs = y.size(0)
-            total_loss += loss.item() * bs
+            total_loss += loss.detach().double() * bs
             total += bs
-            correct += (out.argmax(1) == y).sum().item()
-        log(f"[warmup head] epoch {e} loss {total_loss / max(total, 1):.4f} "
-            f"acc {100.0 * correct / max(total, 1):.2f}%")
+            correct += (out.argmax(1) == y).sum()
+        log(f"[warmup head] epoch {e} loss {(total_loss / max(total, 1)).item():.4f} "
+            f"acc {(100.0 * correct.double() / max(total, 1)).item():.2f}%")
 
     for p in model.parameters():
         p.requires_grad = True

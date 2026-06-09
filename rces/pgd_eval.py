@@ -22,18 +22,20 @@ EPS_BY_DATASET = {
 }
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def clean_accuracy(model, loader, device, max_batches=None):
     model.eval()
-    correct, total = 0, 0
+    correct = torch.zeros((), device=device, dtype=torch.long)
+    total = 0
     for i, (x, y) in enumerate(loader):
         if max_batches is not None and i >= max_batches:
             break
-        x, y = x.to(device), y.to(device)
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
         pred = model(x).argmax(1)
-        correct += (pred == y).sum().item()
+        correct += (pred == y).sum()
         total += y.size(0)
-    return 100.0 * correct / max(total, 1)
+    return (100.0 * correct.double() / max(total, 1)).item()
 
 
 def pgd_accuracy(model, loader, device, eps, alpha=None, steps=50, restarts=1,
@@ -45,12 +47,14 @@ def pgd_accuracy(model, loader, device, eps, alpha=None, steps=50, restarts=1,
     model.eval()
     if alpha is None:
         alpha = 2.5 * eps / max(steps, 1)
-    correct, total = 0, 0
+    correct = torch.zeros((), device=device, dtype=torch.long)
+    total = 0
 
     for i, (x, y) in enumerate(loader):
         if max_batches is not None and i >= max_batches:
             break
-        x, y = x.to(device), y.to(device)
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
         survives = torch.ones(y.size(0), dtype=torch.bool, device=device)
 
         for _ in range(max(restarts, 1)):
@@ -67,14 +71,14 @@ def pgd_accuracy(model, loader, device, eps, alpha=None, steps=50, restarts=1,
                 pred = model(x_adv).argmax(1)
             survives &= (pred == y)
 
-        correct += survives.sum().item()
+        correct += survives.sum()
         total += y.size(0)
 
-    acc = 100.0 * correct / max(total, 1)
+    acc = (100.0 * correct.double() / max(total, 1)).item()
     if logger is not None:
         logger.info(f"[pgd] eps={eps:.5f} alpha={alpha:.5f} steps={steps} "
                     f"restarts={restarts} -> robust acc {acc:.2f}% "
-                    f"({correct}/{total})")
+                    f"({int(correct.item())}/{total})")
     return acc
 
 

@@ -48,12 +48,18 @@ def cifar_loaders(dataset, batch_size, self_normalizing=True,
     train = cls(root=root, train=True, download=True, transform=train_tf)
     test = cls(root=root, train=False, download=True, transform=test_tf)
 
+    # persistent_workers avoids re-spawning workers every epoch (big win on
+    # Windows 'spawn'); prefetch_factor deepens the input queue. Both require
+    # num_workers > 0 (PyTorch raises otherwise).
+    common = dict(num_workers=num_workers, pin_memory=True)
+    if num_workers > 0:
+        common["persistent_workers"] = True
+    train_extra = {**common, "prefetch_factor": 4} if num_workers > 0 else common
+
     train_loader = torch.utils.data.DataLoader(
-        train, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True)
+        train, batch_size=batch_size, shuffle=True, **train_extra)
     test_loader = torch.utils.data.DataLoader(
-        test, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True)
+        test, batch_size=batch_size, shuffle=False, **common)
     return train_loader, test_loader
 
 
@@ -84,12 +90,16 @@ def tiny_imagenet_loaders(batch_size, img_size=224, self_normalizing=True,
     train = datasets.ImageFolder(train_dir, transform=train_tf)
     test = datasets.ImageFolder(val_dir, transform=test_tf)
 
+    # See cifar_loaders: persistent_workers + prefetch_factor (gated on workers>0).
+    common = dict(num_workers=num_workers, pin_memory=True)
+    if num_workers > 0:
+        common["persistent_workers"] = True
+    train_extra = {**common, "prefetch_factor": 4} if num_workers > 0 else common
+
     train_loader = torch.utils.data.DataLoader(
-        train, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True)
+        train, batch_size=batch_size, shuffle=True, **train_extra)
     test_loader = torch.utils.data.DataLoader(
-        test, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True)
+        test, batch_size=batch_size, shuffle=False, **common)
     return train_loader, test_loader
 
 

@@ -212,27 +212,35 @@ class CIFAR10C(Dataset):
 
 class adv_dataset(Dataset):
     def __init__(self):
+        # Accumulate per-batch chunks in a list and concatenate ONCE, lazily.
+        # The old code did `torch.cat((self.images, images))` every batch, which
+        # is O(n^2) copies of a resident (often GPU) tensor plus a sync per call.
+        self._img_chunks = []
+        self._lbl_chunks = []
         self.images = None
         self.labels = None
 
     def append_data(self, images, labels):
-        if self.images is None:
-            self.images = images
-            self.labels = labels
-        else:
-            # print(images.shape)
-            # print(self.images.shape)
+        # Store on CPU so the full adversarial set does not pin GPU memory.
+        self._img_chunks.append(images.detach().to("cpu", copy=False))
+        self._lbl_chunks.append(labels.detach().to("cpu", copy=False))
+        # Invalidate any previously materialized cache.
+        self.images = None
+        self.labels = None
 
-            self.images = torch.cat((self.images, images), dim=0)
-            self.labels = torch.cat((self.labels, labels), dim=0)
+    def _materialize(self):
+        if self.images is None:
+            if not self._img_chunks:
+                raise RuntimeError("adv_dataset is empty; call append_data() first.")
+            self.images = torch.cat(self._img_chunks, dim=0)
+            self.labels = torch.cat(self._lbl_chunks, dim=0)
 
     def __getitem__(self, item):
-        img = self.images[item]
-        label = self.labels[item]
-        # print(img.shape)
-        return img, label
+        self._materialize()
+        return self.images[item], self.labels[item]
 
     def __len__(self):
+        self._materialize()
         return self.images.shape[0]
 
 
@@ -262,7 +270,19 @@ class mini_imagenet_dataset(Dataset):
         return len(self.imgs)
 
 
-def create_dataloader(dataset, batch_size, use_val=True, transform_dict=None, resize=None):
+def create_dataloader(dataset, batch_size, use_val=True, transform_dict=None, resize=None,
+                      num_workers=4, pin_memory=True):
+    # Shared DataLoader kwargs. On Windows the worker start method is "spawn",
+    # so persistent_workers=True avoids re-forking all workers every epoch (a
+    # large fixed stall on short CIFAR epochs). prefetch_factor only applies
+    # when num_workers > 0; both are illegal/raise with num_workers == 0.
+    common_kwargs = dict(num_workers=num_workers, pin_memory=pin_memory)
+    if num_workers > 0:
+        common_kwargs["persistent_workers"] = True
+    train_kwargs = dict(common_kwargs)
+    if num_workers > 0:
+        train_kwargs["prefetch_factor"] = 4
+
     if dataset == "TinyImageNet":
         if transform_dict is not None:
             transform_train, transform_test = transform_dict["train"], transform_dict["test"]
@@ -282,9 +302,9 @@ def create_dataloader(dataset, batch_size, use_val=True, transform_dict=None, re
 
         train_dataset = TinyImageNet("train", transform_train)
         testset = TinyImageNet("val", transform_test)
-        trainloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8)
+        trainloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, **train_kwargs)
         valloader = None
-        testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=8)        
+        testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, **common_kwargs)
 
     if dataset == "CIFAR10":
         if transform_dict is not None:
@@ -315,22 +335,22 @@ def create_dataloader(dataset, batch_size, use_val=True, transform_dict=None, re
             valid_sampler = SubsetRandomSampler(valid_idx)
 
             trainloader = torch.utils.data.DataLoader(
-                train_dataset, batch_size=batch_size, sampler=train_sampler, shuffle=True,
-                num_workers=8, worker_init_fn=seed_worker, generator=g
+                train_dataset, batch_size=batch_size, sampler=train_sampler,
+                worker_init_fn=seed_worker, generator=g, **train_kwargs
             )
             valloader = torch.utils.data.DataLoader(
                 valid_dataset, batch_size=batch_size, sampler=valid_sampler,
-                num_workers=8, worker_init_fn=seed_worker, generator=g
+                worker_init_fn=seed_worker, generator=g, **common_kwargs
             )
         else:
             trainloader = torch.utils.data.DataLoader(
-                train_dataset, batch_size=batch_size, shuffle=True, num_workers=8)
+                train_dataset, batch_size=batch_size, shuffle=True, **train_kwargs)
             valloader = None
         testset = torchvision.datasets.CIFAR10(
             root='./data', train=False, download=True, transform=transform_test)
 
         testloader = torch.utils.data.DataLoader(
-            testset, batch_size=batch_size, shuffle=False, num_workers=8)
+            testset, batch_size=batch_size, shuffle=False, **common_kwargs)
 
     if dataset == "CIFAR100":
         if transform_dict is not None:
@@ -364,20 +384,20 @@ def create_dataloader(dataset, batch_size, use_val=True, transform_dict=None, re
             valid_sampler = SubsetRandomSampler(valid_idx)
             
             trainloader = torch.utils.data.DataLoader(
-                train_dataset, batch_size=batch_size, sampler=train_sampler, shuffle=True,
-                num_workers=8, worker_init_fn=seed_worker, generator=g
+                train_dataset, batch_size=batch_size, sampler=train_sampler,
+                worker_init_fn=seed_worker, generator=g, **train_kwargs
             )
             valloader = torch.utils.data.DataLoader(
                 valid_dataset, batch_size=batch_size, sampler=valid_sampler,
-                num_workers=8, worker_init_fn=seed_worker, generator=g
+                worker_init_fn=seed_worker, generator=g, **common_kwargs
             )
         
         else:
-            trainloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8)
+            trainloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, **train_kwargs)
             valloader = None
 
         testset = torchvision.datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
 
-        testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=8)
+        testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, **common_kwargs)
 
     return trainloader, valloader, testloader

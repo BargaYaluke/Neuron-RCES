@@ -10,3 +10,5 @@ logs/
 *.ckpt
 *.tar
 *.npz
+__pycache__/
+*.pyc

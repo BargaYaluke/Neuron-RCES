@@ -241,21 +241,24 @@ def evaluate_cifar_corruption(args, model, data_dir="./data/CIFAR-100-C"):
 
 def evaluate(args, model, dataloader, criterion):
     model.eval()
-    total_loss = 0.0
-    correct = 0
+    device = args.device
+    # GPU-resident accumulators: avoid a per-batch .item() CUDA sync.
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    correct = torch.zeros((), device=device, dtype=torch.long)
     total = 0
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch_idx, (inputs, targets) in enumerate(dataloader):
-            inputs, targets = inputs.to(args.device), targets.to(args.device)
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
             outputs = model(inputs)
             batch_loss = criterion(outputs, targets)
-            total_loss += batch_loss.item() * targets.size(0)
+            loss_sum += batch_loss.detach().double() * targets.size(0)
             _, predicted = outputs.max(1)
             total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
+            correct += predicted.eq(targets).sum()
 
-    acc = 100. * correct / total
-    avg_loss = total_loss / total if total else 0.0
+    acc = (100. * correct.double() / total).item() if total else 0.0
+    avg_loss = (loss_sum / total).item() if total else 0.0
     return avg_loss, acc
 
 

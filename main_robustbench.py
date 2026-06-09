@@ -116,6 +116,12 @@ def parse_args():
     p.add_argument("--head_warmup_epochs", default=0, type=int,
                    help="linear-probe the fresh head before sparse adaptation")
     p.add_argument("--head_warmup_lr", default=1e-3, type=float)
+    p.add_argument("--amp", action="store_true", default=False,
+                   help="enable torch.cuda.amp mixed precision in the adaptation loop "
+                        "(fp16 compute; gradient mask stays exact). Off by default.")
+    p.add_argument("--tf32", action="store_true", default=False,
+                   help="allow TF32 tensor-core matmul/conv on Ampere+ (perturbs the fp32 "
+                        "path / robust-acc reporting). Off by default.")
     # evaluation
     p.add_argument("--eps_override", default=None, type=float,
                    help="override Linf eps (default per dataset: cifar 8/255, "
@@ -131,7 +137,8 @@ def parse_args():
     # misc
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", default=0, type=int)
-    p.add_argument("--num_workers", default=8, type=int)
+    p.add_argument("--num_workers", default=(2 if os.name == "nt" else 8), type=int,
+                   help="DataLoader workers (Windows defaults lower: spawn is costly)")
     p.add_argument("--diagnostic_only", action="store_true",
                    help="print module inventory + data-condition, then exit")
     return p.parse_args()
@@ -143,6 +150,12 @@ def main():
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed)
+        # Fixed input shapes (224 XCiT / 32 CIFAR) -> let cuDNN autotune conv algos.
+        torch.backends.cudnn.benchmark = True
+        if args.tf32:
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
     save_dir = f"./results/{args.arch}_{args.dataset}/robustbench/"
     os.makedirs(save_dir, exist_ok=True)
@@ -257,6 +270,8 @@ def main():
                                 momentum=args.momentum, weight_decay=args.wd)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=[max(args.epochs // 2, 1)], gamma=0.1)
+    scaler = torch.cuda.amp.GradScaler(
+        enabled=(args.amp and str(args.device).startswith("cuda")))
 
     # ------------------------------------------------------------------ #
     # 8) initial eval
@@ -275,7 +290,7 @@ def main():
     for epoch in range(args.epochs):
         train_loss, train_acc = adapt_one_epoch(
             model, train_loader, optimizer, criterion, new_masks,
-            args.device, epoch, logger)
+            args.device, epoch, logger, scaler=scaler)
         clean_acc = clean_accuracy(model, test_loader, args.device, args.eval_batches)
 
         robust_acc = None

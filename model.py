@@ -53,20 +53,42 @@ def create_model(model_name, input_size, num_classes, device, patch_size=4, resu
 
     model = model.to(device)
 
-    if device == "cuda":
+    # Only wrap in DataParallel when there is genuinely more than one GPU.
+    # On a single GPU, DataParallel is pure overhead: it replicates the model
+    # and scatters/gathers every forward pass on the GIL-bound main thread,
+    # which leaves the GPU idle between tiny kernel bursts ("memory not full,
+    # throughput low"). The old `device == "cuda"` check also silently missed
+    # "cuda:0". Numerically identical to the unwrapped model on one device.
+    if str(device).startswith("cuda") and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
 
     if resume is not None:
-        checkpoint = torch.load(resume)
+        checkpoint = torch.load(resume, map_location=device)
         if "net" in checkpoint.keys():
-            model.load_state_dict(checkpoint["net"])
+            state = checkpoint["net"]
         elif "state_dict" in checkpoint.keys():
-            model.load_state_dict(checkpoint["state_dict"])
+            state = checkpoint["state_dict"]
         elif "model" in checkpoint.keys():
-            model.load_state_dict(checkpoint["model"])
+            state = checkpoint["model"]
         else:
-            model.load_state_dict(checkpoint)
+            state = checkpoint
+        # Tolerate checkpoints saved with/without the DataParallel "module." prefix
+        # regardless of how the current model is wrapped.
+        model.load_state_dict(_align_state_dict_prefix(model, state))
 
     return model
+
+
+def _align_state_dict_prefix(model, state):
+    """Add or strip the leading 'module.' on every key so a checkpoint loads
+    whether or not it (and the current model) was DataParallel-wrapped."""
+    wrapped = any(k.startswith("module.") for k in model.state_dict().keys())
+    has_prefix = any(k.startswith("module.") for k in state.keys())
+    if wrapped and not has_prefix:
+        return {f"module.{k}": v for k, v in state.items()}
+    if not wrapped and has_prefix:
+        return {k[len("module."):] if k.startswith("module.") else k: v
+                for k, v in state.items()}
+    return state
 
 
