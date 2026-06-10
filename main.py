@@ -459,6 +459,10 @@ def parse_args():
                     help="random seed used to sample the adv_subset indices")
     parser.add_argument("--mask_mode", type=str, default="grad", choices=["grad", "param"],
                     help="grad: gate gradients; param: hard-freeze frozen entries after optimizer step")
+    parser.add_argument("--run_tag", type=str, default="",
+                    help="optional suffix appended to the checkpoint/mask dir so ablation cells "
+                         "(e.g. a_nrc_ce / b_nrc_supcon / c_rand_ce) never overwrite each other. "
+                         "Empty = original path (backward compatible).")
 
 # ---------- 性能 / 吞吐相关参数 ----------
     parser.add_argument('--num_workers', type=int, default=(2 if os.name == "nt" else 4),
@@ -773,6 +777,11 @@ def main():
     suffix = '{}_{}_lr={}_wd={}_epochs={}_neurons={}'.format(
     proj_name, args.optim, args.lr, args.wd, args.epochs, args.neurons_per_layer
     )
+    # Isolate ablation cells: selection (neuron_masks.pth) and finetune (best_params,
+    # experiment_record, logs) all live under model_save_dir/<suffix>. Without a tag,
+    # cells a/b/c with the same hyperparams clobber one another's masks and records.
+    if getattr(args, "run_tag", ""):
+        suffix = suffix + "_" + args.run_tag
     # 模型 checkpoint 目录
     model_save_dir = f'./results/{args.model}_{args.dataset}/checkpoint/{suffix}/'
     os.makedirs(model_save_dir, exist_ok=True)
