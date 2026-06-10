@@ -322,9 +322,24 @@ def neuron_mrc_and_prune(args, model,
             f"alive_zero_grad={alive_zero_grad.sum()}, "
             f"alive_with_grad={alive_with_grad.sum()}")
 
-        # 5.3 计算每个“神经元”的相对 MRC ≈ ||grad||_2 / (||w||_2 + eps)
+        # 5.3 计算每个“神经元”的相对 NRC = ||grad||_2 / (denom + eps)
+        #     分子恒为 grad_norm = ||grad||_2（L2 梯度范数）；归一化消融只改“分母”。
+        #     weight_norm（L2）保持不变，仅用于上面的死/活神经元分类与下面的
+        #     valid_mask —— 这样 none/l1/l2/linf 四个变体的“候选神经元集合”完全
+        #     一致，唯一变化的是层内排序（=被选中的那 k 个神经元）。
         eps = 1e-12
-        mrc_per_neuron = grad_norm / (weight_norm + eps)
+        norm_mode = getattr(args, "norm_mode", "l2")
+        if norm_mode == "none":
+            denom = np.ones_like(grad_norm)                        # 无归一化：原始梯度范数
+        elif norm_mode == "l1":
+            denom = np.linalg.norm(weight_2d, ord=1, axis=1)       # ||W||_1 = sum|w|
+        elif norm_mode == "l2":
+            denom = weight_norm                                    # ||W||_2（主方法）
+        elif norm_mode == "linf":
+            denom = np.linalg.norm(weight_2d, ord=np.inf, axis=1)  # ||W||_inf = max|w|
+        else:
+            raise ValueError(f"unknown --norm_mode={norm_mode!r} (use none|l1|l2|linf)")
+        mrc_per_neuron = grad_norm / (denom + eps)
 
         for j in range(B):
             neuron_mrc_list.append(
@@ -431,6 +446,21 @@ def parse_args():
                         help="number of adversarial batches used to accumulate gradient for Neuron-MRC")
     parser.add_argument("--epsilon", default=0.1, type=float,
                         help="perturbation bound (for consistency with layer-level RiFT)")
+
+# ---------- ✅ 归一化消融：分母（normalizer）选择 ----------
+# NRC = ||grad||_2 / (denom + eps)。分子恒为 ||grad||_2（L2 梯度范数），
+# 本消融只改“分母”这一个变量：
+#   none -> denom=1（原始梯度范数，无归一化，对照基准）
+#   l1   -> ||W||_1
+#   l2   -> ||W||_2（主方法，默认）
+#   linf -> ||W||_inf
+# 注意：fan-in / cohort-L∞ 这类“层内常数”归一化在“逐层 top-k 选择”下与
+# none 完全等价（分母对同层所有神经元相同会被 argsort 约掉），故不在此处提供。
+    parser.add_argument("--norm_mode", default="l2", type=str,
+                        choices=["none", "l1", "l2", "linf"],
+                        help="denominator used to normalize the per-neuron NRC score. "
+                             "Numerator (grad L2 norm) and the alive-neuron candidate set "
+                             "are held fixed; only this normalizer varies.")
 
 # ---------- 训练参数 ----------
     parser.add_argument('--lr', default=0.001, type=float, help='learning rate')
@@ -909,13 +939,18 @@ def main():
             np.array(neuron_mrc_list, dtype=object)
         )
         torch.save(
-            {"masks": new_masks, "statistic": statistic},
+            {"masks": new_masks, "statistic": statistic,
+             # stamp the normalizer here: the finetune phase rewrites
+             # experiment_record.json in the same dir, but never touches this file,
+             # so this is the authoritative record of which denominator was used.
+             "norm_mode": getattr(args, "norm_mode", "l2")},
             os.path.join(model_save_dir, "neuron_masks.pth")
         )
         logger.info("==> Neuron-level MRC computed and saved, exit.")
 
         # === 记录神经元选择阶段信息 ===
         experiment_record["selection_phase"] = {
+            "norm_mode": getattr(args, "norm_mode", "l2"),
             "num_grad_batches": args.num_grad_batches,
             "neurons_per_layer": args.neurons_per_layer,
             "selected_neurons": selected_neurons_per_layer,
